@@ -1,0 +1,64 @@
+================================================================================
+RELATÓRIO: COMPARAÇÃO DE MÉTODOS DE OTIMIZAÇÃO
+Problema: Alocação de Pacientes em Hospitais
+================================================================================
+
+1. INFORMAÇÃO DO PROBLEMA
+--------------------------------------------------------------------------------
+  • Número de pacientes: 117
+  • Número de enfermarias: 4
+  • Número de especializações: 4
+  • Período de planeamento: 7 dias
+  • Pesos: λ1=0.5 (custo), λ2=0.5 (equilíbrio)
+
+2. RESULTADOS POR MÉTODO
+--------------------------------------------------------------------------------
+
+  1. Branch & Bound (Exato)
+     Tipo: Exato
+     Tempo de execução: 0.0100 segundos
+     Valor objetivo: 5380.91
+     Gap de otimalidade: 0.000046%
+
+  2. Simulated Annealing
+     Tipo: Metaheurística
+     Tempo de execução: 0.1645 segundos
+     Valor objetivo: 5729.94
+
+  3. Tabu Search
+     Tipo: Metaheurística
+     Tempo de execução: 22.5360 segundos
+     Valor objetivo: 5872.41
+
+  4. Híbrido (SA + B&B)
+     Tipo: Híbrido
+     Tempo de execução: 0.1920 segundos
+     Valor objetivo: 5380.91
+
+3. ANÁLISE COMPARATIVA
+--------------------------------------------------------------------------------
+
+  ⭐ MELHOR SOLUÇÃO: Branch & Bound (Exato)
+     Objetivo: 5380.91
+
+  ⚡ MÉTODO MAIS RÁPIDO: Branch & Bound (Exato)
+     Tempo: 0.0100s
+
+  📊 DESVIO EM RELAÇÃO AO ÓTIMO:
+     Simulated Annealing: +6.49%
+     Tabu Search: +9.13%
+     Híbrido (SA + B&B): +0.00%
+
+4. CONCLUSÕES
+--------------------------------------------------------------------------------
+
+  ✓ O método híbrido conseguiu atingir a solução ótima!
+    Tempo total: 0.19s
+
+  • Branch & Bound: Garante otimalidade mas pode ser lento.
+  • Metaheurísticas: Rápidas mas não garantem otimalidade.
+  • Híbrido: Combina velocidade inicial com refinamento exato.
+
+================================================================================
+FIM DO RELATÓRIO
+================================================================================

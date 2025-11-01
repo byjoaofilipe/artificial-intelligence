@@ -1,0 +1,30 @@
+================================================================================
+RELATÓRIO DE ANÁLISE EM BATCH
+================================================================================
+
+Número de instâncias processadas: 1
+Métodos testados: ['bb', 'sa', 'hybrid']
+
+ESTATÍSTICAS AGREGADAS
+--------------------------------------------------------------------------------
+
+Branch & Bound:
+  Tempo médio: 0.01s (±nan)
+  Tempo mediano: 0.01s
+  Objetivo médio: 5380.91
+
+Simulated Annealing:
+  Tempo médio: 0.17s (±nan)
+  Tempo mediano: 0.17s
+  Objetivo médio: 5819.41
+  Desvio médio: 8.15%
+  Instâncias ótimas: 0/1
+
+Híbrido:
+  Tempo médio: 0.19s (±nan)
+  Tempo mediano: 0.19s
+  Objetivo médio: 5380.91
+  Desvio médio: -0.00%
+  Instâncias ótimas: 0/1
+
+================================================================================

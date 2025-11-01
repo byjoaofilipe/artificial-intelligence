@@ -1,0 +1,2 @@
+filename,num_patients,num_wards,num_days,M,bb_time,bb_objective,bb_gap,bb_status,sa_time,sa_objective,sa_feasible,hybrid_time,hybrid_objective,hybrid_mh_obj,hybrid_improvement,sa_deviation,hybrid_deviation
+s0m0.dat,117,4,7,0,0.012641191482543945,5380.909285714286,4.6460549096163696e-07,optimal,0.16628146171569824,5819.414285714286,True,0.18812084197998047,5380.9077380952385,5767.9077380952385,6.709538667617466,8.14927323090508,-2.8761292287966716e-05
