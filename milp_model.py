@@ -1,6 +1,11 @@
 """
 Modelo MILP (Mixed Integer Linear Programming) para o problema de alocação de pacientes.
 Usa o Gurobi como solver para encontrar a solução ótima (Método 1 - Branch & Bound).
+
+VERSÃO CORRIGIDA - Problemas resolvidos:
+1. Restrição de capacidade de camas corrigida (uso correto de quicksum)
+2. Restrição de workload corrigida (separação de constantes e variáveis)
+3. Melhor estruturação das expressões lineares
 """
 
 import gurobipy as gp
@@ -31,7 +36,7 @@ class PatientAllocationMILP:
         # Variáveis de decisão
         self.y = {}  # y[p,w,d] = 1 se paciente p é admitido na enfermaria w no dia d
         self.x = {}  # x[w,d] = carga de trabalho normalizada na enfermaria w no dia d
-        self.z = {}  # z = máximo da carga de trabalho (para minimizar)
+        self.z = None  # z = máximo da carga de trabalho (para minimizar)
         self.v_overtime = {}   # v[s,d] = overtime da especialização s no dia d
         self.u_undertime = {}  # u[s,d] = undertime da especialização s no dia d
         
@@ -72,12 +77,11 @@ class PatientAllocationMILP:
                 if (spec == ward['major_specialization'] or 
                     spec in ward['minor_specializations']):
                     
-                    for d in range(earliest, latest + 1):
-                        if d < self.data.num_days:
-                            self.y[patient_id, ward_name, d] = self.model.addVar(
-                                vtype=GRB.BINARY,
-                                name=f"y_{patient_id}_{ward_name}_{d}"
-                            )
+                    for d in range(earliest, min(latest + 1, self.data.num_days)):
+                        self.y[patient_id, ward_name, d] = self.model.addVar(
+                            vtype=GRB.BINARY,
+                            name=f"y_{patient_id}_{ward_name}_{d}"
+                        )
         
         # X[w,d] - Carga de trabalho normalizada
         print("  Criando variáveis X (carga de trabalho)...")
@@ -124,34 +128,26 @@ class PatientAllocationMILP:
         print("  Adicionando restrição: cada paciente admitido uma vez...")
         for patient_id in self.data.patients.keys():
             self.model.addConstr(
-                gp.quicksum(self.y[p_w_d] for p_w_d in self.y.keys() if p_w_d[0] == patient_id) == 1,
+                gp.quicksum(self.y[key] for key in self.y.keys() if key[0] == patient_id) == 1,
                 name=f"admit_once_{patient_id}"
             )
         
-        # RESTRIÇÃO 2: Capacidade de camas das enfermarias
+        # RESTRIÇÃO 2: Capacidade de camas das enfermarias [CORRIGIDA]
         print("  Adicionando restrição: capacidade de camas...")
         for ward_name, ward in self.data.wards.items():
             for d in range(self.data.num_days):
-                # Contar pacientes na enfermaria no dia d
-                # = carryover + pacientes admitidos que ainda estão internados
+                # Somar APENAS as variáveis de decisão
+                patients_in_ward = gp.quicksum(
+                    self.y[patient_id, ward_name, admit_day]
+                    for patient_id, patient in self.data.patients.items()
+                    for admit_day in range(max(0, d - patient['los'] + 1), min(d + 1, self.data.num_days))
+                    if (patient_id, ward_name, admit_day) in self.y
+                    and admit_day <= d < admit_day + patient['los']
+                )
                 
-                patients_in_ward = ward['carryover_patients'][d]  # Pacientes pré-existentes
-                
-                # Somar pacientes admitidos através das nossas decisões
-                for patient_id, patient in self.data.patients.items():
-                    los = patient['los']
-                    earliest = patient['earliest']
-                    
-                    # Para cada dia de admissão possível
-                    for admit_day in range(max(0, d - los + 1), min(d + 1, self.data.num_days)):
-                        if (patient_id, ward_name, admit_day) in self.y:
-                            # Se paciente for admitido em admit_day e los > (d - admit_day),
-                            # então ele está na enfermaria no dia d
-                            if admit_day <= d < admit_day + los:
-                                patients_in_ward += self.y[patient_id, ward_name, admit_day]
-                
+                # Constraint: carryover (constante) + novas admissões (variáveis) <= capacidade
                 self.model.addConstr(
-                    patients_in_ward <= ward['bed_capacity'],
+                    ward['carryover_patients'][d] + patients_in_ward <= ward['bed_capacity'],
                     name=f"bed_capacity_{ward_name}_{d}"
                 )
         
@@ -161,7 +157,7 @@ class PatientAllocationMILP:
             for d in range(self.data.num_days):
                 # Tempo total usado = soma das durações de cirurgia dos pacientes admitidos no dia d
                 ot_used = gp.quicksum(
-                    self.data.patients[patient_id]['surgery_duration'] * self.y[patient_id, ward_name, d]
+                    self.data.patients[patient_id]['surgery_duration'] * self.y[patient_id, ward_name, admit_day]
                     for (patient_id, ward_name, admit_day) in self.y.keys()
                     if admit_day == d and self.data.patients[patient_id]['specialization'] == spec
                 )
@@ -174,16 +170,15 @@ class PatientAllocationMILP:
                     name=f"ot_time_{spec}_{d}"
                 )
         
-        # RESTRIÇÃO 4: Cálculo da carga de trabalho normalizada X[w,d]
+        # RESTRIÇÃO 4: Cálculo da carga de trabalho normalizada X[w,d] [CORRIGIDA]
         print("  Adicionando restrição: cálculo de carga de trabalho...")
         for ward_name, ward in self.data.wards.items():
             workload_capacity = ward['workload_capacity']
             
             for d in range(self.data.num_days):
-                # Carga de trabalho no dia d
-                total_workload = ward['carryover_workload'][d]  # Carga pré-existente
+                # Carga de trabalho das NOVAS admissões (só variáveis)
+                workload_from_new_patients = 0
                 
-                # Adicionar carga dos pacientes que admitimos
                 for patient_id, patient in self.data.patients.items():
                     spec = patient['specialization']
                     los = patient['los']
@@ -203,11 +198,11 @@ class PatientAllocationMILP:
                                 day_of_stay = d - admit_day
                                 if day_of_stay < len(workload_per_day):
                                     workload_contribution = workload_per_day[day_of_stay] * scaling_factor
-                                    total_workload += workload_contribution * self.y[patient_id, ward_name, admit_day]
+                                    workload_from_new_patients += workload_contribution * self.y[patient_id, ward_name, admit_day]
                 
-                # X[w,d] = total_workload / workload_capacity (normalizado)
+                # X[w,d] * capacity = carryover (constante) + new_patients (variáveis)
                 self.model.addConstr(
-                    self.x[ward_name, d] * workload_capacity == total_workload,
+                    self.x[ward_name, d] * workload_capacity == ward['carryover_workload'][d] + workload_from_new_patients,
                     name=f"workload_{ward_name}_{d}"
                 )
         
@@ -311,7 +306,7 @@ class PatientAllocationMILP:
             if var.X > 0.5:  # Variável binária = 1
                 self.solution[patient_id] = {
                     'ward': ward_name,
-                    'admission_day': d,
+                    'day': d,
                     'patient_data': self.data.patients[patient_id]
                 }
     
@@ -346,7 +341,7 @@ class PatientAllocationMILP:
             print(f"\n{patient_id}:")
             print(f"  Especialização: {patient['specialization']}")
             print(f"  Enfermaria: {alloc['ward']}")
-            print(f"  Dia de admissão: {alloc['admission_day']}")
+            print(f"  Dia de admissão: {alloc['day']}")
             print(f"  Janela permitida: [{patient['earliest']}, {patient['latest']}]")
             print(f"  Permanência: {patient['los']} dias")
 
@@ -355,8 +350,9 @@ class PatientAllocationMILP:
 if __name__ == "__main__":
     # Carregar dados
     print("Carregando dados...")
-    data = PatientAllocationData('/mnt/user-data/uploads/s0m0.dat')
-    
+    data = PatientAllocationData("/Users/paolopascarelli/Desktop/Introduction to AI/Data for Generating balanced workload allocations in hospitals/instances/s0m3.dat")
+
+
     # Criar e resolver modelo
     model = PatientAllocationMILP(data, lambda1=0.5, lambda2=0.5)
     model.build_model()
