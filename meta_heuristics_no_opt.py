@@ -1,26 +1,17 @@
+# metaheuristics.py - VERSION WITHOUT EXTERNAL LOCAL SEARCH
+
 """
-metaheuristics.py
+Fast metaheuristics for Patient Allocation.
 
-Fast metaheuristics for the Patient Allocation problem.
+PIPELINE:
+- Greedy constructive heuristic producing a bed-feasible solution
+- ILS with internal fast local search and bed-capacity penalties
+- VNS with internal fast local search and bed-capacity penalties
 
-This module implements a complete heuristic pipeline:
-
-    1. Greedy feasible construction
-    2. Greedy local improvement (deterministic hill-climbing)
-    3. Iterated Local Search (ILS) with fast local search and perturbations
-    4. Variable Neighborhood Search (VNS) with multiple shaking operators
-
-The goal is to produce high-quality FEASIBLE solutions on large instances
-where an exact MILP approach may be too slow or fail to find feasibility.
-
-All methods assume:
-- A PatientAllocationData object with:
-    * patients
-    * wards
-    * specialisms
-    * capacity, workload, OR availability, etc.
-- Compatibility constraints based on specialization
-- Bed capacity constraints per ward/day
+KEY DESIGN CHOICES:
+- No external greedy_local_improvement (it was too slow)
+- ILS/VNS internal local search samples only a subset of patients and few days
+- Timeouts enforced on local search and metaheuristics
 """
 
 import random
@@ -32,18 +23,16 @@ from data_parser import PatientAllocationData
 
 
 # =====================================================================
-#                         UTILITY FUNCTIONS
+#                            UTILITIES
 # =====================================================================
 
 def compatible_wards_for_patient(data: PatientAllocationData, patient):
     """
-    Return the list of wards where the given patient can be admitted.
+    Return the list of wards compatible with a given patient.
 
-    A ward is compatible if:
-    - the patient's specialization is equal to the ward's major specialization, OR
-    - the patient's specialization is included in ward["minor_specializations"].
-
-    This compatibility check is used everywhere: greedy, local search, ILS, VNS.
+    Compatibility is based on specialization:
+    - patient's specialization equals ward["major_specialization"], or
+    - patient's specialization is in ward["minor_specializations"].
     """
     spec = patient["specialization"]
     wards = []
@@ -55,11 +44,11 @@ def compatible_wards_for_patient(data: PatientAllocationData, patient):
 
 def count_beds_used_on_day(data: PatientAllocationData, allocation, ward_name, d):
     """
-    Count the number of beds used in ward 'ward_name' on day d.
+    Count how many beds are used in ward 'ward_name' on day d.
 
-    Beds are occupied by:
-    - carryover patients from previous planning horizons (fixed)
-    - all patients assigned to this ward whose length of stay overlaps day d
+    Includes:
+    - carryover patients fixed in data
+    - all allocated patients whose length of stay covers day d.
     """
     used = data.wards[ward_name]["carryover_patients"][d]
     for pid, a in allocation.items():
@@ -73,18 +62,21 @@ def count_beds_used_on_day(data: PatientAllocationData, allocation, ward_name, d
 
 def feasible_after_change_beds(data: PatientAllocationData, allocation, change=None):
     """
-    Check bed feasibility of an allocation, optionally after applying a single change.
+    Check bed-capacity feasibility, optionally after a single change.
 
     Parameters
     ----------
+    allocation : dict
+        Current allocation {pid: {"ward": w, "day": d}}.
     change : tuple or None
-        If not None, must be (pid, new_ward, new_day) and the allocation is
-        temporarily modified before checking capacity violations.
+        If None, the whole 'allocation' is checked as is.
+        If (pid, new_ward, new_day), a shallow copy with this modification
+        is checked instead.
 
     Returns
     -------
     bool
-        True if for all wards and days, used beds <= bed capacity.
+        True if for all wards and days bed usage does not exceed capacity.
     """
     if change is not None:
         pid, new_ward, new_day = change
@@ -102,13 +94,13 @@ def feasible_after_change_beds(data: PatientAllocationData, allocation, change=N
 
 def bed_capacity_violations(data: PatientAllocationData, allocation):
     """
-    Compute the total amount of bed capacity violations (soft measure).
+    Compute the total amount of bed-capacity violations.
 
     Returns
     -------
     int
-        Sum over all wards and days of (used beds - capacity) whenever positive.
-        This is used to penalize infeasible solutions in metaheuristics.
+        Sum over all wards and days of (used beds - capacity), whenever positive.
+        This is used as a soft penalty measure in the metaheuristics.
     """
     vio = 0
     for wname, ward in data.wards.items():
@@ -124,8 +116,9 @@ def compute_ot_used_by_spec_day(data: PatientAllocationData, allocation, spec, d
     """
     Compute operating theatre time used by specialization 'spec' on day d.
 
-    Sums the surgery_duration of all patients of specialization 'spec'
-    whose surgery day equals d.
+    Sums the surgery_duration of all patients whose:
+    - specialization == spec
+    - surgery day == d.
     """
     total = 0
     for pid, a in allocation.items():
@@ -137,20 +130,20 @@ def compute_ot_used_by_spec_day(data: PatientAllocationData, allocation, spec, d
 
 def compute_workload_normalized_and_z(data: PatientAllocationData, allocation):
     """
-    Compute normalized workload x[(ward, day)] and the maximum value z.
+    Compute normalized workloads and their maximum.
 
     For each ward/day:
-    - total workload is computed from carryover workload + patients admitted
-      whose stay covers that day
-    - workload is normalized by ward capacity
-    - z is the maximum normalized workload over all ward/day pairs
+    - accumulate workload from carryover and allocated patients
+    - apply workload_factor when specialization is minor in that ward
+    - normalize by workload_capacity
+    - track the maximum normalized workload z (for balancing)
 
     Returns
     -------
     x : dict
         Mapping (ward_name, day) -> normalized workload.
     z : float
-        Maximum normalized workload across all (ward, day).
+        Maximum normalized workload across all ward/day pairs.
     """
     x = {}
     z = 0.0
@@ -168,7 +161,6 @@ def compute_workload_normalized_and_z(data: PatientAllocationData, allocation):
                     if 0 <= day_of_stay < len(p["workload_per_day"]):
                         base = p["workload_per_day"][day_of_stay]
                         spec = p["specialization"]
-                        # If the patient spec is minor in this ward, apply workload factor.
                         if spec != ward["major_specialization"] and spec in ward["minor_specializations"]:
                             base *= data.specialisms[spec]["workload_factor"]
                         total_w += base
@@ -179,22 +171,22 @@ def compute_workload_normalized_and_z(data: PatientAllocationData, allocation):
 
 def compute_objective_components(data: PatientAllocationData, allocation):
     """
-    Compute the main objective components:
-    - total delays (admission day - earliest)
-    - total OR overtime and undertime
-    - maximum normalized workload z
-    - workload map and OR usage map (for analysis/diagnostics)
+    Compute the individual objective components.
 
     Returns
     -------
     delays : float
+        Sum over patients of (admission day - earliest) if positive.
     total_overtime : float
+        Total OR overtime across all specializations/days.
     total_undertime : float
+        Total OR unused time across all specializations/days.
     z : float
+        Maximum normalized workload across ward/day pairs.
     x_map : dict
-        Workload per (ward, day).
+        Normalized workload map (ward, day) -> x.
     ot_used_map : dict
-        For each (spec, day): (used, avail, overtime, undertime).
+        Detailed OR usage map: (spec, day) -> (used, available, overtime, undertime).
     """
     # Admission delays
     delays = 0.0
@@ -202,7 +194,7 @@ def compute_objective_components(data: PatientAllocationData, allocation):
         p = data.patients[pid]
         delays += max(0, a["day"] - p["earliest"])
 
-    # OR overtime and undertime
+    # OR overtime / undertime
     total_overtime = 0.0
     total_undertime = 0.0
     ot_used_map = {}
@@ -217,26 +209,25 @@ def compute_objective_components(data: PatientAllocationData, allocation):
                 total_undertime += (avail - used)
                 ot_used_map[(spec, d)] = (used, avail, 0, avail - used)
 
-    # Workload balancing (max normalized workload z)
     x_map, z = compute_workload_normalized_and_z(data, allocation)
     return delays, total_overtime, total_undertime, z, x_map, ot_used_map
 
 
 def objective_value(data: PatientAllocationData, allocation, lambda1=0.5, lambda2=0.5):
     """
-    Compute the scalarized objective: λ1 * f1 + λ2 * f2.
+    Compute the scalarized objective:
+        f = λ1 * f1 + λ2 * f2
 
-    f1 combines:
-        - weighted OR overtime
-        - weighted OR undertime
-        - weighted admission delays
-    f2 is:
-        - maximum normalized workload (z)
+    where:
+        f1 = weight_overtime * OT_overtime
+           + weight_undertime * OT_undertime
+           + weight_delay * delays
+        f2 = z (maximum normalized workload)
 
     Parameters
     ----------
     lambda1, lambda2 : float
-        Scalarization weights for the two objective components.
+        Weights for the scalarization of the multi-objective problem.
     """
     delays, ovt, undt, z, _, _ = compute_objective_components(data, allocation)
     f1 = data.weight_overtime * ovt + data.weight_undertime * undt + data.weight_delay * delays
@@ -252,16 +243,12 @@ def objective_value_penalized(
     penalty_weight=1000.0
 ):
     """
-    Penalized objective for metaheuristics.
+    Penalized objective used inside metaheuristics.
 
-    Uses the scalarized objective plus a large penalty for any bed capacity violations.
-    This allows metaheuristics to explore slightly infeasible solutions but pushes them
-    towards feasibility during search.
+    f_pen = f + penalty_weight * (total bed-capacity violations)
 
-    Parameters
-    ----------
-    penalty_weight : float
-        Penalty coefficient multiplied by total bed violations.
+    This allows the search to temporarily explore infeasible regions while
+    strongly favoring solutions with fewer or no violations.
     """
     f_obj = objective_value(data, allocation, lambda1, lambda2)
     violations = bed_capacity_violations(data, allocation)
@@ -269,15 +256,16 @@ def objective_value_penalized(
 
 
 # =====================================================================
-#                          GREEDY CONSTRUCTION
+#                      GREEDY CONSTRUCTIVE HEURISTIC
 # =====================================================================
 
 def _score_trial(data, alloc, pid, w, d, lambda1, lambda2):
     """
-    Helper for greedy phase: evaluate assigning pid to ward w at day d.
+    Evaluate a trial assignment used only as a fallback in greedy.
 
-    Returns inf if the resulting allocation violates bed capacity;
-    otherwise returns the objective value of the trial allocation.
+    Computes the objective value if we assign patient pid to ward w on day d,
+    assuming bed-capacity feasibility. If that move would violate bed capacity,
+    returns +infinity.
     """
     trial = copy.deepcopy(alloc)
     trial[pid] = {"ward": w, "day": d}
@@ -286,16 +274,25 @@ def _score_trial(data, alloc, pid, w, d, lambda1, lambda2):
     return objective_value(data, trial, lambda1, lambda2)
 
 
-def _tiny_repair_shift_same_ward_day_forward(data, alloc, ward_name, congested_day, max_shifts=3):
+def _tiny_repair_shift_same_ward_day_forward(
+    data,
+    alloc,
+    ward_name,
+    congested_day,
+    max_shifts=3
+):
     """
-    Small, cheap repair heuristic:
-    when a given ward/day is congested, try to move a few patients (up to max_shifts)
-    one day forward (within their latest day) to free capacity.
+    Small local repair to free beds on a congested day in a ward.
+
+    Strategy:
+    - Identify patients currently occupying beds in 'ward_name' on 'congested_day'.
+    - Try to move up to 'max_shifts' of them one day forward within their time window.
+    - Only accept moves that maintain bed feasibility.
 
     Returns
     -------
     bool
-        True if at least one successful shift is applied, False otherwise.
+        True if at least one patient was shifted, False otherwise.
     """
     candidates = []
     for pid, a in alloc.items():
@@ -312,7 +309,6 @@ def _tiny_repair_shift_same_ward_day_forward(data, alloc, ward_name, congested_d
             break
         p = data.patients[pid]
         a_day = alloc[pid]["day"]
-        # Shift one day forward if still within latest and horizon
         if a_day + 1 <= min(p["latest"], data.num_days - 1):
             trial = copy.deepcopy(alloc)
             trial[pid]["day"] = a_day + 1
@@ -325,19 +321,26 @@ def _tiny_repair_shift_same_ward_day_forward(data, alloc, ward_name, congested_d
 
 def greedy_feasible_by_window_strict(data: PatientAllocationData):
     """
-    Construct an initial feasible allocation using strict greedy rules.
+    Construct a bed-feasible solution using a strict greedy heuristic.
 
-    Patients are ordered by:
-    - smallest (latest - earliest) window first (tighter windows are more critical)
-    - then by earliest admission day
-    - then by decreasing length of stay
+    Procedure
+    ---------
+    1. Sort patients by:
+       - (latest - earliest) ascending (tighter windows first)
+       - earliest ascending
+       - length of stay descending
+    2. For each patient:
+       - greedily try compatible wards/days respecting bed capacities
+       - if no direct placement is found, attempt a small repair to free beds
+       - if still no placement, select the ward/day combination minimizing
+         the objective among feasible options
+    3. If a patient cannot be placed at all, raise a RuntimeError
+       (instance is too saturated).
 
-    For each patient:
-    - try to place them in a compatible ward and day without violating capacity
-    - attempt small repairs if necessary
-    - as last resort, pick the position minimizing the objective among feasible moves
-
-    If no placement is possible, raises a RuntimeError (instance is too saturated).
+    Returns
+    -------
+    alloc : dict
+        Feasible allocation mapping each pid to {"ward": w, "day": d}.
     """
     patients_order = sorted(
         data.patients.items(),
@@ -355,7 +358,7 @@ def greedy_feasible_by_window_strict(data: PatientAllocationData):
         los = p["los"]
         placed = False
 
-        # 1) Try a direct feasible assignment without repairs
+        # 1) Pure greedy respecting bed capacity
         for w in wards:
             ward = data.wards[w]
             cap = ward["bed_capacity"]
@@ -374,7 +377,7 @@ def greedy_feasible_by_window_strict(data: PatientAllocationData):
             if placed:
                 break
 
-        # 2) If not placed, try a tiny repair shifting other patients one day forward
+        # 2) Small repair if we did not manage to place the patient
         if not placed:
             for w in wards:
                 for d in range(p["earliest"], min(p["latest"] + 1, data.num_days)):
@@ -387,7 +390,7 @@ def greedy_feasible_by_window_strict(data: PatientAllocationData):
                             ):
                                 break
 
-            # 3) After repair attempts, try again to place greedily
+            # Try again greedily after repair
             for w in wards:
                 cap = data.wards[w]["bed_capacity"]
                 for d in range(p["earliest"], min(p["latest"] + 1, data.num_days)):
@@ -404,7 +407,7 @@ def greedy_feasible_by_window_strict(data: PatientAllocationData):
                 if placed:
                     break
 
-        # 4) As a fallback, choose the least damaging feasible position
+        # 3) Fallback: choose the best feasible position by objective value
         if not placed:
             lambda1, lambda2 = 0.5, 0.5
             best_score = float('inf')
@@ -422,115 +425,26 @@ def greedy_feasible_by_window_strict(data: PatientAllocationData):
                 placed = True
 
         if not placed:
-            raise RuntimeError(f"❌ Nessun posto disponibile per {pid} — istanza troppo satura.")
+            raise RuntimeError(f"❌ No bed available for {pid} — instance too saturated.")
 
     return alloc
 
 
 # =====================================================================
-#                     GREEDY + LOCAL IMPROVEMENT
-# =====================================================================
-
-def greedy_local_improvement(
-    data: PatientAllocationData,
-    start_allocation,
-    lambda1=0.5,
-    lambda2=0.5,
-    max_rounds=6
-):
-    """
-    Apply a deterministic local search to improve the greedy solution.
-
-    Strategy:
-    - Identify patients contributing most to delay
-    - For each such patient:
-        * try moving them to different days (same ward)
-        * try moving them to different compatible wards (same day)
-    - Accept only moves that strictly improve the objective value
-
-    Parameters
-    ----------
-    start_allocation : dict
-        Initial feasible allocation, typically from greedy_feasible_by_window_strict.
-    """
-    current = copy.deepcopy(start_allocation)
-    curr_val = objective_value(data, current, lambda1, lambda2)
-
-    for _ in range(max_rounds):
-        improved = False
-        no_improve = True
-
-        # Compute contribution to delay cost for each patient
-        delays, ovt, undt, z, x_map, ot_map = compute_objective_components(data, current)
-        patient_contributions = []
-        for pid in data.patients.keys():
-            p = data.patients[pid]
-            a = current[pid]
-            contrib = max(0, a["day"] - p["earliest"]) * data.weight_delay
-            patient_contributions.append((contrib, pid))
-        patient_contributions.sort(reverse=True)
-        ordered_pids = [pid for _, pid in patient_contributions]
-
-        # Try improving patients in order of their delay contribution
-        for pid in ordered_pids:
-            p = data.patients[pid]
-            base = current[pid]
-            best_move = base
-            best_val = curr_val
-
-            # 1) Try different days in the same ward
-            for d in range(p["earliest"], min(p["latest"] + 1, data.num_days)):
-                if d == base["day"]:
-                    continue
-                if not feasible_after_change_beds(data, current, (pid, base["ward"], d)):
-                    continue
-                trial = copy.deepcopy(current)
-                trial[pid] = {"ward": base["ward"], "day": d}
-                val = objective_value(data, trial, lambda1, lambda2)
-                if val + 1e-9 < best_val:
-                    best_val = val
-                    best_move = {"ward": base["ward"], "day": d}
-
-            # 2) Try different wards on the same day
-            wards = compatible_wards_for_patient(data, p)
-            for w in wards:
-                if w == base["ward"]:
-                    continue
-                if not feasible_after_change_beds(data, current, (pid, w, base["day"])):
-                    continue
-                trial = copy.deepcopy(current)
-                trial[pid] = {"ward": w, "day": base["day"]}
-                val = objective_value(data, trial, lambda1, lambda2)
-                if val + 1e-9 < best_val:
-                    best_val = val
-                    best_move = {"ward": w, "day": base["day"]}
-
-            # Apply the best move if it improves the objective
-            if best_move != base:
-                current[pid] = best_move
-                curr_val = best_val
-                improved = True
-                no_improve = False
-
-        if no_improve:
-            break
-
-    return current, curr_val
-
-
-# =====================================================================
-#                      ITERATED LOCAL SEARCH (ILS)
+#                   ITERATED LOCAL SEARCH (ILS) - FAST
 # =====================================================================
 
 class IteratedLocalSearch:
     """
-    Iterated Local Search (ILS) for Patient Allocation.
+    Fast Iterated Local Search (ILS) for Patient Allocation.
 
-    Features:
-    - Fast local search operating on a subset of patients and days
-    - Penalized objective to handle temporary infeasibility
-    - Mixed perturbation (random + worst contributors)
-    - Stagnation-based perturbation intensification
+    Characteristics:
+    - Internal fast local search:
+        * samples only a subset of patients
+        * tests a few random days per patient
+        * uses penalized objective
+    - Uses bed-feasible best solution tracking
+    - Perturbation mechanism triggered by stagnation
     """
 
     def __init__(
@@ -549,28 +463,27 @@ class IteratedLocalSearch:
         self.best_feasible_value = float("inf")
         self.solve_time = None
 
-        # Number of iterations without improvement before triggering perturbation
+        # Stagnation and perturbation parameters
         self.STAGNATION_LIMIT = 20
-        # Base and max ratio of patients perturbed when diversification is needed
         self.PERTURB_BASE_RATIO = 0.10
         self.PERTURB_MAX_RATIO = 0.25
 
     def _perturbation_mixed(self, allocation, intensity=0.10):
         """
-        Apply a mixed perturbation to the allocation.
+        Mixed perturbation operator.
 
-        - Selects up to 'intensity' * num_patients patients to modify.
-        - Half of them are the worst contributors in terms of delay.
-        - The other half are randomly selected.
+        Selects up to 'intensity * |patients|' patients to perturb:
+        - half are the worst contributors with regard to admission delay
+        - half are randomly selected
 
         For each selected patient:
         - assign a random compatible ward
-        - assign a random day within their [earliest, latest] window
+        - assign a random day within [earliest, latest]
         """
         perturbed = copy.deepcopy(allocation)
         num_to_perturb = max(1, int(len(self.data.patients) * intensity))
 
-        # Identify worst contributors w.r.t delay
+        # Identify worst contributors (by delay)
         worst_pids = []
         for pid in self.data.patients.keys():
             p = self.data.patients[pid]
@@ -580,7 +493,7 @@ class IteratedLocalSearch:
         worst_pids.sort(reverse=True)
         worst_contributors = [pid for _, pid in worst_pids[:num_to_perturb // 2]]
 
-        # 50% random patients + 50% worst contributors
+        # 50% random + 50% worst contributors
         num_random = num_to_perturb // 2
         patients_random = random.sample(list(self.data.patients.keys()), num_random)
         patients_to_perturb = patients_random + worst_contributors
@@ -596,19 +509,20 @@ class IteratedLocalSearch:
 
     def _local_search_fast(self, allocation, max_time_seconds=30):
         """
-        Fast local search for ILS using a penalized objective.
+        Fast local search used inside ILS.
 
-        Optimizations:
-        - No deep copy at each move (in-place changes + rollback)
-        - Sample only a subset of patients (≈30%) per iteration
-        - For each selected patient, try only a few random days
-        - Stop when:
-          * no improvements are found OR
-          * time limit is reached OR
-          * max_iterations is reached
+        Features:
+        - works directly on the passed allocation (no global deepcopy)
+        - samples only a subset of patients per iteration (~30%)
+        - tests a few random days (up to 3) per patient
+        - uses the penalized objective to guide the search
+        - stops on:
+            * no improvement,
+            * max_iterations reached, or
+            * time limit exceeded
         """
         t0 = time.time()
-        current = allocation  # Intentionally no deepcopy here
+        current = allocation
         curr_val = objective_value_penalized(
             self.data, current, self.lambda1, self.lambda2, self.penalty_weight
         )
@@ -624,7 +538,6 @@ class IteratedLocalSearch:
             improved = False
             iterations += 1
 
-            # Sample a subset of patients
             pids_sample = random.sample(
                 list(self.data.patients.keys()),
                 min(num_patients_to_check, len(self.data.patients))
@@ -637,7 +550,6 @@ class IteratedLocalSearch:
                 p = self.data.patients[pid]
                 base = current[pid]
 
-                # Try only a few random days in the allowed window
                 possible_days = list(range(p["earliest"], min(p["latest"] + 1, self.data.num_days)))
                 days_to_try = random.sample(possible_days, min(3, len(possible_days)))
 
@@ -645,7 +557,6 @@ class IteratedLocalSearch:
                     if d == base["day"]:
                         continue
 
-                    # In-place modification + restore if no improvement
                     old_day = current[pid]["day"]
                     current[pid]["day"] = d
                     val = objective_value_penalized(
@@ -655,7 +566,7 @@ class IteratedLocalSearch:
                     if val + 1e-9 < curr_val:
                         curr_val = val
                         improved = True
-                        break  # First-improvement strategy
+                        break  # first-improvement strategy
                     else:
                         current[pid]["day"] = old_day
 
@@ -667,39 +578,53 @@ class IteratedLocalSearch:
 
         return current, curr_val
 
-    def solve(self, start_allocation, max_iterations=50, max_time_minutes=10, verbose=True):
+    def solve(
+        self,
+        start_allocation,
+        max_iterations=50,
+        max_time_minutes=10,
+        verbose=True
+    ):
         """
-        Run the full Iterated Local Search (ILS) procedure.
+        Run the full ILS procedure starting from a feasible allocation.
 
         Steps
         -----
-        1. Initialize with a feasible allocation (must be feasible).
-        2. Repeatedly:
-           - apply fast local search
-           - if the solution is feasible and better than the current best,
-             update the global best
-           - if stagnation exceeds STAGNATION_LIMIT, apply perturbation
-        3. Stop when:
-           - time limit is reached, OR
-           - max_iterations is reached, OR
-           - extended stagnation is detected
+        1. Validate starting solution (must be bed-feasible).
+        2. Initialize best_feasible with the starting objective.
+        3. Iterations:
+            - run fast local search on the current solution
+            - if the resulting solution is bed-feasible, evaluate the
+              non-penalized objective and update the global best if improved
+            - count iterations without improvement; when stagnation exceeds
+              STAGNATION_LIMIT, apply a perturbation around the current best
+        4. Stop when:
+            - time limit is reached, OR
+            - max_iterations is reached, OR
+            - extended stagnation triggers early stopping.
 
         Returns
         -------
-        dict with keys:
-            "objective_value", "solve_time", "allocation"
+        dict
+            {
+                "objective_value": best feasible objective,
+                "solve_time": runtime in seconds,
+                "allocation": best feasible allocation
+            }
         """
         t0 = time.time()
         max_time_seconds = max_time_minutes * 60
 
         current = copy.deepcopy(start_allocation)
 
-        # Ensure starting solution is feasible with respect to bed capacity
+        # Ensure starting solution is bed-feasible
         if feasible_after_change_beds(self.data, current):
             self.best_feasible_allocation = copy.deepcopy(current)
-            self.best_feasible_value = objective_value(self.data, current, self.lambda1, self.lambda2)
+            self.best_feasible_value = objective_value(
+                self.data, current, self.lambda1, self.lambda2
+            )
         else:
-            raise ValueError("Start allocation must be feasible!")
+            raise ValueError("Start allocation must be feasible with respect to beds!")
 
         no_improve_counter = 0
 
@@ -716,10 +641,10 @@ class IteratedLocalSearch:
                     print(f"\n⏱️  Timeout reached ({max_time_minutes} min)")
                 break
 
-            # Local search from current solution
+            # Local search from current solution (penalized objective)
             current, curr_val_pen = self._local_search_fast(current, max_time_seconds=30)
 
-            # If the locally improved solution is feasible, evaluate non-penalized objective
+            # If locally improved solution is bed-feasible, evaluate clean objective
             if feasible_after_change_beds(self.data, current):
                 curr_val = objective_value(self.data, current, self.lambda1, self.lambda2)
 
@@ -734,10 +659,9 @@ class IteratedLocalSearch:
                 else:
                     no_improve_counter += 1
             else:
-                # Infeasible after local search → count as non-improvement
                 no_improve_counter += 1
 
-            # Stagnation-based perturbation
+            # Apply perturbation when stagnation is detected
             if no_improve_counter >= self.STAGNATION_LIMIT:
                 intensity = min(
                     self.PERTURB_MAX_RATIO,
@@ -745,12 +669,12 @@ class IteratedLocalSearch:
                 )
 
                 if verbose:
-                    print(f"Iter {iteration}: Perturbazione ({intensity * 100:.0f}% pazienti)")
+                    print(f"Iter {iteration}: Perturbation ({intensity * 100:.0f}% patients)")
 
                 current = self._perturbation_mixed(self.best_feasible_allocation, intensity)
                 no_improve_counter = 0
 
-            # Extended stagnation: early stop
+            # Extended stagnation → early stop
             if no_improve_counter >= self.STAGNATION_LIMIT * 2:
                 if verbose:
                     print(f"\n⚠️  Stopping early: no improvement")
@@ -770,28 +694,32 @@ class IteratedLocalSearch:
 
 
 # =====================================================================
-#                 VARIABLE NEIGHBORHOOD SEARCH (VNS)
+#              VARIABLE NEIGHBORHOOD SEARCH (VNS) - FAST
 # =====================================================================
 
 class VariableNeighborhoodSearch:
     """
-    Variable Neighborhood Search (VNS) for Patient Allocation.
+    Fast Variable Neighborhood Search (VNS) for Patient Allocation.
 
-    The algorithm explores a sequence of neighborhoods N1..Nk:
-
-    N1: small day shifts for a single patient
+    Neighborhoods
+    -------------
+    N1: small day shift for a single patient
     N2: change ward for a single patient
-    N3: multi-patient random modifications (days or wards)
-    N4: swap assignments between two patients (if compatible)
+    N3: multi-move (day or ward) for 1–2 patients
+    N4: swap assignments (ward + day) between two compatible patients
 
-    Workflow:
-    - Shake (apply Nk)
-    - Local search (fast, penalized)
-    - If improved:
-        * update best solution
-        * restart from neighborhood N1
-      Else:
-        * move to next neighborhood
+    Workflow
+    --------
+    - Start from a bed-feasible solution
+    - For k = 1..K_MAX:
+        * shake (apply Nk)
+        * run fast local search (penalized)
+        * if a feasible and improved solution is found:
+              - update global best
+              - set current = improved solution
+              - reset k = 1 (intensification)
+          else:
+              - k += 1 (diversification)
     """
 
     def __init__(
@@ -810,15 +738,16 @@ class VariableNeighborhoodSearch:
         self.best_feasible_value = float("inf")
         self.solve_time = None
 
-        # Maximum neighborhood index (we have N1..N4)
         self.K_MAX = 4
+
+    # ------------------- Neighborhood definitions -------------------
 
     def _shake_N1(self, allocation):
         """
-        Neighborhood N1: small day shifts for a single patient.
+        Neighborhood N1: small day shift for a single patient.
 
-        Randomly picks a patient and shifts their admission day by
-        -2, -1, +1, or +2 days, if still within their time window.
+        Randomly picks a patient and shifts their day by -2, -1, +1, or +2
+        if the new day remains within [earliest, latest].
         """
         shaken = copy.deepcopy(allocation)
         pid = random.choice(list(self.data.patients.keys()))
@@ -833,10 +762,10 @@ class VariableNeighborhoodSearch:
 
     def _shake_N2(self, allocation):
         """
-        Neighborhood N2: change ward for a single patient.
+        Neighborhood N2: ward change for a single patient.
 
-        Picks a random patient and moves them to a different
-        compatible ward, if there is more than one option.
+        Randomly picks a patient and moves them to a different compatible ward
+        (if more than one ward is available).
         """
         shaken = copy.deepcopy(allocation)
         pid = random.choice(list(self.data.patients.keys()))
@@ -849,14 +778,17 @@ class VariableNeighborhoodSearch:
 
     def _shake_N3(self, allocation):
         """
-        Neighborhood N3: multi-patient perturbation.
+        Neighborhood N3: multi-move for 1–2 patients.
 
-        Randomly selects up to 2 patients and either:
-        - randomly change their day within their feasible window, OR
-        - randomly change their ward within compatible wards.
+        For each selected patient:
+        - either change day randomly within [earliest, latest], OR
+        - change ward randomly among compatible wards.
         """
         shaken = copy.deepcopy(allocation)
-        pids_to_move = random.sample(list(self.data.patients.keys()), min(2, len(self.data.patients)))
+        pids_to_move = random.sample(
+            list(self.data.patients.keys()),
+            min(2, len(self.data.patients))
+        )
         for pid in pids_to_move:
             p = self.data.patients[pid]
             if random.random() < 0.5:
@@ -873,10 +805,9 @@ class VariableNeighborhoodSearch:
         """
         Neighborhood N4: swap assignments between two patients.
 
-        Randomly picks two patients and attempts to swap their ward/day.
-        The swap is applied only if:
+        Swaps ward and day between two randomly selected patients, if:
         - each new ward is compatible with the other patient
-        - each new day is within the other patient's admissible window
+        - each new day is within the other's admissible window.
         """
         shaken = copy.deepcopy(allocation)
         if len(self.data.patients) >= 2:
@@ -900,7 +831,7 @@ class VariableNeighborhoodSearch:
 
     def _shake(self, allocation, k):
         """
-        Apply the shaking operator corresponding to neighborhood k.
+        Dispatch method for shaking according to neighborhood index k.
         """
         if k == 1:
             return self._shake_N1(allocation)
@@ -911,14 +842,16 @@ class VariableNeighborhoodSearch:
         else:
             return self._shake_N4(allocation)
 
+    # ------------------- Internal local search -------------------
+
     def _local_search_fast(self, allocation, max_time_seconds=15):
         """
-        Fast local search for VNS using the penalized objective.
+        Fast internal local search used inside VNS.
 
-        Similar structure as in the ILS local search, but:
+        Similar to the ILS local search but:
         - fewer iterations
-        - smaller sample of patients
-        - fewer days per patient
+        - smaller patient sample
+        - fewer days tested per patient
         """
         t0 = time.time()
         current = allocation
@@ -977,41 +910,55 @@ class VariableNeighborhoodSearch:
 
         return current, curr_val
 
-    def solve(self, start_allocation, max_iterations=100, max_time_minutes=10, verbose=True):
+    def solve(
+        self,
+        start_allocation,
+        max_iterations=100,
+        max_time_minutes=10,
+        verbose=True
+    ):
         """
-        Run the full Variable Neighborhood Search (VNS) procedure.
+        Run the Variable Neighborhood Search (VNS) starting from a feasible solution.
 
         Steps
         -----
-        1. Initialize with a feasible allocation.
-        2. For k = 1..K_MAX:
-            - Apply shaking in neighborhood Nk
-            - Run local search from the shaken solution
-            - If feasible and improved:
-                * update global best
-                * restart k from 1
-              Else:
-                * increase k (move to next neighborhood)
-        3. Stop when:
+        1. Validate starting solution (must be bed-feasible).
+        2. Initialize best_feasible with starting objective.
+        3. Main loop:
+            - For k in {1..K_MAX}:
+                * shake current solution in Nk
+                * run fast local search from shaken solution
+                * if the resulting solution is bed-feasible and better:
+                    - update global best
+                    - set current = improved solution
+                    - reset k = 1
+                  else:
+                    - k += 1
+        4. Stop when:
             - time limit is reached, OR
             - max_iterations is reached.
 
         Returns
         -------
-        dict with keys:
-            "objective_value", "solve_time", "allocation"
+        dict
+            {
+                "objective_value": best feasible objective,
+                "solve_time": runtime in seconds,
+                "allocation": best feasible allocation
+            }
         """
         t0 = time.time()
         max_time_seconds = max_time_minutes * 60
 
         current = copy.deepcopy(start_allocation)
 
-        # Ensure starting solution is feasible
         if feasible_after_change_beds(self.data, current):
             self.best_feasible_allocation = copy.deepcopy(current)
-            self.best_feasible_value = objective_value(self.data, current, self.lambda1, self.lambda2)
+            self.best_feasible_value = objective_value(
+                self.data, current, self.lambda1, self.lambda2
+            )
         else:
-            raise ValueError("Start allocation must be feasible!")
+            raise ValueError("Start allocation must be feasible with respect to beds!")
 
         if verbose:
             print("\n" + "=" * 60)
@@ -1033,37 +980,41 @@ class VariableNeighborhoodSearch:
 
             # Shake current solution in neighborhood Nk
             shaken = self._shake(current, k)
-            # Local search from shaken solution
             improved_solution, improved_val_pen = self._local_search_fast(
                 shaken, max_time_seconds=15
             )
 
-            # If locally improved solution is feasible, update best if needed
             if feasible_after_change_beds(self.data, improved_solution):
-                improved_val = objective_value(self.data, improved_solution, self.lambda1, self.lambda2)
+                improved_val = objective_value(
+                    self.data, improved_solution, self.lambda1, self.lambda2
+                )
 
                 if improved_val + 1e-9 < self.best_feasible_value:
                     self.best_feasible_value = improved_val
                     self.best_feasible_allocation = copy.deepcopy(improved_solution)
                     current = improved_solution
-                    k = 1  # Intensification: restart from neighborhood N1
+                    k = 1  # restart from smallest neighborhood
 
                     if verbose:
                         elapsed = time.time() - t0
-                        print(f"Iter {iteration} ({elapsed:.0f}s): f = {improved_val:.2f} ✓ NEW BEST (N{k})")
+                        print(
+                            f"Iter {iteration} ({elapsed:.0f}s): "
+                            f"f = {improved_val:.2f} ✓ NEW BEST (N{k})"
+                        )
                 else:
                     k += 1
             else:
-                # Infeasible solution → just move to next neighborhood
                 k += 1
 
-            # Cycle neighborhoods if we exceed K_MAX
             if k > self.K_MAX:
                 k = 1
 
             if iteration % 20 == 0 and verbose:
                 elapsed = time.time() - t0
-                print(f"Iter {iteration} ({elapsed:.0f}s): exploring N{k}, best = {self.best_feasible_value:.2f}")
+                print(
+                    f"Iter {iteration} ({elapsed:.0f}s): "
+                    f"exploring N{k}, best = {self.best_feasible_value:.2f}"
+                )
 
         self.solve_time = time.time() - t0
 
@@ -1079,7 +1030,7 @@ class VariableNeighborhoodSearch:
 
 
 # =====================================================================
-#                             RUNNER
+#                               RUNNER
 # =====================================================================
 
 def run_metaheuristics(
@@ -1097,26 +1048,29 @@ def run_metaheuristics(
     """
     Run the full metaheuristic pipeline on a given instance:
 
-        1. Greedy feasible construction
-        2. Greedy + local improvement
-        3. Iterated Local Search (ILS)
-        4. Variable Neighborhood Search (VNS)
+        1. Greedy constructive heuristic
+        2. Iterated Local Search (ILS) starting from the greedy solution
+        3. Variable Neighborhood Search (VNS) starting from the greedy solution
+           (can optionally be started from ILS result as a variant)
 
-    Returns a dictionary with:
-        - greedy_det: objective, time, allocation
-        - local: objective, time, allocation
-        - ils: objective, time, allocation
-        - vns: objective, time, allocation
-        - total_time: total runtime of the pipeline
+    Returns
+    -------
+    dict
+        {
+            "greedy_det": {"f", "t", "allocation"},
+            "ils": {...},
+            "vns": {...},
+            "total_time": total runtime in seconds
+        }
     """
     t_all = time.time()
 
     if verbose:
         print("\n" + "=" * 78)
-        print("PIPELINE: Greedy -> Local -> ILS (FAST) -> VNS (FAST)")
+        print("PIPELINE: Greedy -> ILS (FAST) -> VNS (FAST)")
         print("=" * 78)
 
-    # 1) Greedy feasible solution
+    # 1) Greedy constructive
     t0 = time.time()
     alloc0 = greedy_feasible_by_window_strict(data)
     t_construct = time.time() - t0
@@ -1124,20 +1078,24 @@ def run_metaheuristics(
     if verbose:
         print(f"\nGreedy feasible: f={f0:.2f}  (t={t_construct:.2f}s)")
 
-    # 2) Greedy + local improvement
-    t0 = time.time()
-    alloc1, f1 = greedy_local_improvement(data, alloc0, lambda1, lambda2, max_rounds=6)
-    t_greedy = time.time() - t0
-    if verbose:
-        print(f"Greedy+LocalImprovement: f={f1:.2f}  (t={t_greedy:.2f}s)")
-
-    # 3) ILS
+    # 2) ILS starting from greedy solution
     ILS = IteratedLocalSearch(data, lambda1, lambda2, penalty_weight=ils_penalty)
-    ils_res = ILS.solve(alloc1, max_iterations=ils_max_iter, max_time_minutes=ils_max_time_min, verbose=verbose)
+    ils_res = ILS.solve(
+        alloc0,
+        max_iterations=ils_max_iter,
+        max_time_minutes=ils_max_time_min,
+        verbose=verbose
+    )
 
-    # 4) VNS
+    # 3) VNS starting from greedy solution
+    # (optionally could use ils_res["allocation"] instead of alloc0)
     VNS = VariableNeighborhoodSearch(data, lambda1, lambda2, penalty_weight=vns_penalty)
-    vns_res = VNS.solve(alloc1, max_iterations=vns_max_iter, max_time_minutes=vns_max_time_min, verbose=verbose)
+    vns_res = VNS.solve(
+        alloc0,
+        max_iterations=vns_max_iter,
+        max_time_minutes=vns_max_time_min,
+        verbose=verbose
+    )
 
     total_time = time.time() - t_all
 
@@ -1146,7 +1104,6 @@ def run_metaheuristics(
         print("SUMMARY")
         print("-" * 78)
         print(f"Greedy  : f={f0:.2f}, t={t_construct:.2f}s")
-        print(f"Local   : f={f1:.2f}, t={t_greedy:.2f}s")
         print(f"ILS     : f={ils_res['objective_value']:.2f}, t={ils_res['solve_time']:.2f}s")
         print(f"VNS     : f={vns_res['objective_value']:.2f}, t={vns_res['solve_time']:.2f}s")
         print(f"TOTAL   : {total_time:.2f}s")
@@ -1154,7 +1111,6 @@ def run_metaheuristics(
 
     return {
         "greedy_det": {"f": f0, "t": t_construct, "allocation": alloc0},
-        "local": {"f": f1, "t": t_greedy, "allocation": alloc1},
         "ils": ils_res,
         "vns": vns_res,
         "total_time": total_time
@@ -1163,7 +1119,7 @@ def run_metaheuristics(
 
 if __name__ == "__main__":
     # Example standalone run on a specific .dat file.
-    # Adapt 'data_path' to your filesystem when testing.
+    # Adjust 'data_path' to match your local environment if needed.
     data_path = "/Users/paolopascarelli/Desktop/Introduction to AI/flexible_large.dat"
     data = PatientAllocationData(data_path)
 
