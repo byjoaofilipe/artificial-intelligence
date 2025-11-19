@@ -350,7 +350,7 @@ class PatientAllocationMILP:
 if __name__ == "__main__":
     # Carregar dados
     print("Carregando dados...")
-    data = PatientAllocationData("/Users/paolopascarelli/Desktop/Introduction to AI/Data for Generating balanced workload allocations in hospitals/instances/s0m3.dat")
+    data = PatientAllocationData("uploads/s0m3.dat")
 
 
     # Criar e resolver modelo

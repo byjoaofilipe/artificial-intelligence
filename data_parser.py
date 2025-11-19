@@ -48,7 +48,7 @@ class PatientAllocationData:
                 i += 1
                 continue
             
-            # Parâmetros gerais
+            # PARSE GENERAL INFO
             if line.startswith('Seed:'):
                 self.seed = int(line.split(':')[1].strip())
             
@@ -67,6 +67,7 @@ class PatientAllocationData:
             elif line.startswith('Days:'):
                 self.num_days = int(line.split(':')[1].strip())
             
+            # PARSE FOR SPECIALISMS
             elif line.startswith('Specialisms:'):
                 num_specialisms = int(line.split(':')[1].strip())
                 # Próximas linhas contêm as especializações
@@ -82,6 +83,7 @@ class PatientAllocationData:
                     }
                 i += num_specialisms
             
+            # PARSE FOR WARDS
             elif line.startswith('Wards:'):
                 num_wards = int(line.split(':')[1].strip())
                 # Próximas linhas contêm as enfermarias
@@ -105,6 +107,7 @@ class PatientAllocationData:
                     }
                 i += num_wards
             
+            # PARSE FOR PATIENTS
             elif line.startswith('Patients:'):
                 num_patients = int(line.split(':')[1].strip())
                 # Próximas linhas contêm os pacientes
@@ -140,6 +143,8 @@ class PatientAllocationData:
         print("=" * 60)
         print("RESUMO DOS DADOS")
         print("=" * 60)
+
+        # GENERAL INFO
         print(f"Período de planeamento: {self.num_days} dias")
         print(f"Especializações menores por enfermaria (M): {self.M}")
         print(f"Pesos: Overtime={self.weight_overtime}, Undertime={self.weight_undertime}, Delay={self.weight_delay}")
@@ -147,16 +152,33 @@ class PatientAllocationData:
         print(f"Número de enfermarias: {len(self.wards)}")
         print(f"Número de pacientes: {len(self.patients)}")
         
+        # SPECIALISM INFO
+        print("\n" + "-" * 60)
+        print("Especializações:")
+        print("-" * 60)
+        for spec_name, spec_data in self.specialisms.items():
+            print(f"\n{spec_name}:")
+            print(f"  Fator de carga de trabalho: {spec_data['workload_factor']}")
+            for i in range(0, self.num_days):
+                print(f"  OT (dia {i}) : {spec_data['ot_time'][i]}")
+                print("-" * 30)
+
+        # WARDS INFO
         print("\n" + "-" * 60)
         print("ENFERMARIAS:")
         print("-" * 60)
         for ward_name, ward_data in self.wards.items():
             print(f"\n{ward_name}:")
             print(f"  Capacidade de camas: {ward_data['bed_capacity']}")
+            print(f"  Capacity de trabalho: {ward_data['workload_capacity']}")
             print(f"  Especialização principal: {ward_data['major_specialization']}")
             print(f"  Especializações menores: {ward_data['minor_specializations']}")
-            print(f"  Pacientes pré-existentes (dia 0): {ward_data['carryover_patients'][0]}")
+            for i in range(0, self.num_days):
+                print(f"  Pacientes pré-existentes (dia {i}) : {ward_data['carryover_patients'][i]}")
+                print(f"  Trabalho pré-existente (dia {i}) : {ward_data['carryover_workload'][i]}")
+                print("-" * 30)
         
+        # PATIENTS INFO
         print("\n" + "-" * 60)
         print("AMOSTRA DE PACIENTES (primeiros 5):")
         print("-" * 60)
@@ -166,6 +188,8 @@ class PatientAllocationData:
             print(f"  Janela de admissão: [{patient_data['earliest']}, {patient_data['latest']}]")
             print(f"  Duração do internamento: {patient_data['los']} dias")
             print(f"  Duração da cirurgia: {patient_data['surgery_duration']} minutos")
+            for i in range(0, patient_data['los']):
+                print(f"  Carga de trabalho (dia {i}): {patient_data['workload_per_day'][i]}")
         
         print("\n" + "=" * 60)
 
@@ -173,7 +197,7 @@ class PatientAllocationData:
 # Teste do parser
 if __name__ == "__main__":
     # Carregar os dados
-    data = PatientAllocationData('/mnt/user-data/uploads/s0m0.dat')
+    data = PatientAllocationData('uploads/s0m0.dat')
     
     # Imprimir resumo
     data.print_summary()
